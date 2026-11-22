@@ -17,11 +17,14 @@ public class Program
     private const int MaxOAuthStates = 512;
     private const string OAuthCookieName = "vtw_oauth";
     private const int DefaultClientPort = 17342;
+    private const string DiscordIssuer = "https://discord.com";
 
     private static readonly TimeSpan JwtLifetime = TimeSpan.FromHours(2);
     private static readonly TimeSpan OAuthTtl = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan RoleCacheTtl = TimeSpan.FromSeconds(45);
     private static readonly TimeSpan MaxRetryAfter = TimeSpan.FromMinutes(1);
+    private const int MaxDiscordResponseBytes = 64 * 1024;
+    private const int MaxTokenExpiresInSeconds = 7 * 24 * 60 * 60;
     private static readonly HttpClient DiscordHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
 
     private static readonly ConcurrentDictionary<string, OAuthState> OAuthStates = new(StringComparer.Ordinal);
@@ -70,16 +73,58 @@ public class Program
     private enum RefreshStatus { Ok, InvalidGrant, Technical }
     private sealed record RefreshOutcome(RefreshStatus Status, string? AccessToken);
 
-    private enum RoleFetchStatus { Ok, Unauthorized, RateLimited, Technical }
+    // Forbidden obejmuje 403/404 z Discorda: użytkownik nie jest członkiem guildu
+    // lub nie ma dostępu do określonego serwera — to definitywna utrata roli.
+    private enum RoleFetchStatus { Ok, Unauthorized, Forbidden, RateLimited, Technical }
     private sealed record RoleFetch(RoleFetchStatus Status, List<string> Roles, TimeSpan? RetryAfter);
 
     public static void Main(string[] args)
     {
-        LoadEnvFile(Path.Combine(AppContext.BaseDirectory, ".env"));
+        var baseEnv = Path.Combine(AppContext.BaseDirectory, ".env");
+        var baseEnvLoaded = File.Exists(baseEnv);
+        if (baseEnvLoaded) LoadEnvFile(baseEnv);
         var cwdEnv = Path.Combine(Directory.GetCurrentDirectory(), ".env");
-        if (!string.Equals(Path.GetFullPath(cwdEnv), Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, ".env")),
-                StringComparison.OrdinalIgnoreCase))
+        if (!baseEnvLoaded &&
+            !string.Equals(Path.GetFullPath(cwdEnv), Path.GetFullPath(baseEnv), StringComparison.OrdinalIgnoreCase))
             LoadEnvFile(cwdEnv);
+
+        // Konfiguracja jest walidowana przed zbudowaniem pipeline — fail-closed.
+        var clientId = Environment.GetEnvironmentVariable("DISCORD_CLIENT_ID") ?? "";
+        var clientSecret = Environment.GetEnvironmentVariable("DISCORD_CLIENT_SECRET") ?? "";
+        var guildId = Environment.GetEnvironmentVariable("DISCORD_GUILD_ID") ?? "";
+        var requiredRoleId = Environment.GetEnvironmentVariable("DISCORD_REQUIRED_ROLE_ID") ?? "";
+        var jwtSecret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? "";
+        var apiUrl = Environment.GetEnvironmentVariable("API_URL") ?? "";
+
+        if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret) ||
+            string.IsNullOrWhiteSpace(guildId) || string.IsNullOrWhiteSpace(requiredRoleId))
+            throw new InvalidOperationException("Brak konfiguracji Discord (DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_GUILD_ID, DISCORD_REQUIRED_ROLE_ID).");
+
+        if (IsPlaceholder(clientSecret))
+            throw new InvalidOperationException("DISCORD_CLIENT_SECRET zawiera wartość przykładową — ustaw prawdziwy secret.");
+
+        ValidateJwtSecret(jwtSecret);
+
+        if (string.IsNullOrWhiteSpace(apiUrl))
+            throw new InvalidOperationException("Brak konfiguracji API_URL (wymagany publiczny adres serwera).");
+
+        if (!Uri.TryCreate(apiUrl, UriKind.Absolute, out var apiUri) ||
+            (apiUri.Scheme != Uri.UriSchemeHttp && apiUri.Scheme != Uri.UriSchemeHttps) ||
+            string.IsNullOrWhiteSpace(apiUri.Host) ||
+            !string.IsNullOrEmpty(apiUri.UserInfo) ||
+            apiUri.AbsolutePath != "/" ||
+            !string.IsNullOrEmpty(apiUri.Query) ||
+            !string.IsNullOrEmpty(apiUri.Fragment))
+            throw new InvalidOperationException("API_URL jest nieprawidłowy — podaj sam origin (np. https://host), bez ścieżki, userinfo, query i fragmentu.");
+
+        var loopbackHosts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "localhost", "127.0.0.1", "::1", "[::1]" };
+        if (apiUri.Scheme != Uri.UriSchemeHttps && !loopbackHosts.Contains(apiUri.Host))
+            throw new InvalidOperationException("API_URL musi używać https dla adresów zdalnych.");
+
+        var config = new DiscordConfig(
+            clientId, clientSecret, guildId, requiredRoleId, jwtSecret,
+            new Uri(apiUri, "/auth/callback").ToString(),
+            apiUri.Scheme == Uri.UriSchemeHttps);
 
         var builder = WebApplication.CreateBuilder(args);
 
@@ -92,8 +137,21 @@ public class Program
         builder.Services.AddRateLimiter(options =>
         {
             options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+            options.OnRejected = async (context, token) =>
+            {
+                var response = context.HttpContext.Response;
+                SetNoStoreHeaders(context.HttpContext);
+                response.StatusCode = StatusCodes.Status429TooManyRequests;
+                response.Headers["Retry-After"] = "60";
+                await response.WriteAsJsonAsync(new
+                {
+                    valid = false,
+                    error = "rate_limited",
+                    message = "Zbyt wiele żądań. Spróbuj ponownie za minutę."
+                }, cancellationToken: token);
+            };
             options.AddPolicy("auth", ctx => RateLimitPartition.GetFixedWindowLimiter(
-                RatePartition(ctx, "auth"),
+                RatePartition(ctx, "auth", config),
                 _ => new FixedWindowRateLimiterOptions
                 {
                     PermitLimit = 12,
@@ -102,7 +160,7 @@ public class Program
                     QueueLimit = 0
                 }));
             options.AddPolicy("api", ctx => RateLimitPartition.GetFixedWindowLimiter(
-                RatePartition(ctx, "api"),
+                RatePartition(ctx, "api", config),
                 _ => new FixedWindowRateLimiterOptions
                 {
                     PermitLimit = 120,
@@ -114,36 +172,6 @@ public class Program
 
         var app = builder.Build();
         app.UseRateLimiter();
-
-        // Brak konfiguracji = serwer nie startuje (fail-closed).
-        var clientId = Environment.GetEnvironmentVariable("DISCORD_CLIENT_ID") ?? "";
-        var clientSecret = Environment.GetEnvironmentVariable("DISCORD_CLIENT_SECRET") ?? "";
-        var guildId = Environment.GetEnvironmentVariable("DISCORD_GUILD_ID") ?? "";
-        var requiredRoleId = Environment.GetEnvironmentVariable("DISCORD_REQUIRED_ROLE_ID") ?? "";
-        var jwtSecret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? "";
-        var apiUrl = Environment.GetEnvironmentVariable("API_URL") ?? "";
-
-        if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret) ||
-            string.IsNullOrWhiteSpace(guildId) || string.IsNullOrWhiteSpace(requiredRoleId))
-            throw new InvalidOperationException("Brak konfiguracji Discord (DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_GUILD_ID, DISCORD_REQUIRED_ROLE_ID).");
-
-        ValidateJwtSecret(jwtSecret);
-
-        if (string.IsNullOrWhiteSpace(apiUrl))
-            throw new InvalidOperationException("Brak konfiguracji API_URL (wymagany publiczny adres serwera).");
-
-        if (!Uri.TryCreate(apiUrl, UriKind.Absolute, out var apiUri) ||
-            (apiUri.Scheme != Uri.UriSchemeHttp && apiUri.Scheme != Uri.UriSchemeHttps))
-            throw new InvalidOperationException("API_URL jest nieprawidłowy.");
-
-        var loopbackHosts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "localhost", "127.0.0.1", "::1", "[::1]" };
-        if (apiUri.Scheme != Uri.UriSchemeHttps && !loopbackHosts.Contains(apiUri.Host))
-            throw new InvalidOperationException("API_URL musi używać https dla adresów zdalnych.");
-
-        var config = new DiscordConfig(
-            clientId, clientSecret, guildId, requiredRoleId, jwtSecret,
-            new Uri(apiUri, "/auth/callback").ToString(),
-            apiUri.Scheme == Uri.UriSchemeHttps);
 
         using var cleanupCts = new CancellationTokenSource();
         app.Lifetime.ApplicationStopping.Register(() => cleanupCts.Cancel());
@@ -204,11 +232,19 @@ public class Program
 
             string? code = ctx.Request.Query["code"].ToString();
             string? state = ctx.Request.Query["state"].ToString();
+            string? issuer = ctx.Request.Query["iss"].ToString();
 
             if (string.IsNullOrWhiteSpace(state) || !IsHex(state, 32, 128))
             {
                 DeleteOAuthCookie(ctx, config);
                 return CallbackHtmlError(ctx, "Nieprawidłowy stan logowania.");
+            }
+
+            // RFC 9207 — odrzucamy mix-up, jeśli Discord zwróci obcy issuer.
+            if (!string.IsNullOrWhiteSpace(issuer) && !string.Equals(issuer, DiscordIssuer, StringComparison.Ordinal))
+            {
+                DeleteOAuthCookie(ctx, config);
+                return CallbackHtmlError(ctx, "Nieprawidłowe źródło logowania.");
             }
 
             if (!TryReadOAuthCookie(ctx, config.JwtSecret, out var cookieState, out var cookiePort,
@@ -253,8 +289,9 @@ public class Program
             if (!tokenResponse.IsSuccessStatusCode)
                 return CallbackRedirect(ctx, port, "Nie udało się pobrać tokenu", ReturnedState(oauth, state));
 
-            var tokenJson = await tokenResponse.Content.ReadAsStringAsync(ctx.RequestAborted);
-            if (!TryParseTokenResponse(tokenJson, out var accessToken, out var refreshToken, out var expiresIn) ||
+            var tokenJson = await ReadBoundedStringAsync(tokenResponse, ctx.RequestAborted);
+            if (tokenJson is null ||
+                !TryParseTokenResponse(tokenJson, out var accessToken, out var refreshToken, out var expiresIn) ||
                 string.IsNullOrWhiteSpace(accessToken))
                 return CallbackRedirect(ctx, port, "Nie udało się pobrać tokenu", ReturnedState(oauth, state));
 
@@ -265,7 +302,9 @@ public class Program
             if (!userResponse.IsSuccessStatusCode)
                 return CallbackRedirect(ctx, port, "Nie udało się pobrać danych użytkownika", ReturnedState(oauth, state));
 
-            var userJson = await userResponse.Content.ReadAsStringAsync(ctx.RequestAborted);
+            var userJson = await ReadBoundedStringAsync(userResponse, ctx.RequestAborted);
+            if (userJson is null)
+                return CallbackRedirect(ctx, port, "Nie udało się pobrać danych użytkownika", ReturnedState(oauth, state));
             string? userId;
             string? username;
             try
@@ -293,7 +332,7 @@ public class Program
                 Username = username!,
                 AccessToken = accessToken,
                 RefreshToken = refreshToken,
-                AccessTokenExpires = DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, expiresIn)),
+                AccessTokenExpires = TokenExpiry(expiresIn),
                 Expires = DateTimeOffset.UtcNow.Add(JwtLifetime)
             };
 
@@ -318,20 +357,21 @@ public class Program
 
         app.MapGet("/api/verify", async (HttpContext ctx) =>
         {
+            SetNoStoreHeaders(ctx);
             string? token = BearerToken(ctx);
             if (token is null || !ValidateJwt(token, config, out var claims))
-                return Results.Unauthorized();
+                return VerifyUnauthorized(ctx, "Token nieprawidłowy lub wygasł.");
 
             string sid = claims.GetValueOrDefault("sid", "");
             if (string.IsNullOrWhiteSpace(sid) || !Sessions.TryGetValue(sid, out var session))
-                return Results.Unauthorized();
+                return VerifyUnauthorized(ctx, "Sesja wygasła. Zaloguj się ponownie.");
 
             lock (session.Sync)
             {
                 if (session.Expires <= DateTimeOffset.UtcNow)
                 {
                     Sessions.TryRemove(sid, out _);
-                    return Results.Unauthorized();
+                    return VerifyUnauthorized(ctx, "Sesja wygasła. Zaloguj się ponownie.");
                 }
             }
 
@@ -345,7 +385,7 @@ public class Program
             if (result.Failure != VerifyFailure.None)
             {
                 RevokeUserSessions(session.UserId);
-                return Results.Unauthorized();
+                return VerifyUnauthorized(ctx, result.Message);
             }
 
             return Results.Ok(new
@@ -355,15 +395,20 @@ public class Program
             });
         }).RequireRateLimiting("api");
 
+        // Usunięcie sesji jest idempotentne: wielokrotne wywołanie (również po wygaśnięciu
+        // JWT, ale z poprawnym podpisem) zwraca 200 i nie może usunąć cudzej sesji.
         app.MapPost("/api/logout", (HttpContext ctx) =>
         {
+            SetNoStoreHeaders(ctx);
             string? token = BearerToken(ctx);
-            if (token is null || !ValidateJwt(token, config, out var claims))
-                return Results.Unauthorized();
+            if (token is null || !ValidateJwt(token, config, out var claims, allowExpired: true))
+                return VerifyUnauthorized(ctx, "Token nieprawidłowy.");
 
             string sid = claims.GetValueOrDefault("sid", "");
-            if (!string.IsNullOrWhiteSpace(sid))
-                Sessions.TryRemove(sid, out _);
+            if (string.IsNullOrWhiteSpace(sid))
+                return VerifyUnauthorized(ctx, "Token nieprawidłowy.");
+
+            Sessions.TryRemove(sid, out _);
             return Results.Ok(new { ok = true });
         }).RequireRateLimiting("api");
 
@@ -379,6 +424,14 @@ public class Program
         ctx.Response.Headers["Pragma"] = "no-cache";
         ctx.Response.Headers["Referrer-Policy"] = "no-referrer";
         ctx.Response.Headers["X-Content-Type-Options"] = "nosniff";
+    }
+
+    private static IResult VerifyUnauthorized(HttpContext ctx, string message)
+    {
+        SetNoStoreHeaders(ctx);
+        ctx.Response.Headers["WWW-Authenticate"] = "Bearer";
+        return Results.Json(new { valid = false, error = "unauthorized", message },
+            statusCode: StatusCodes.Status401Unauthorized);
     }
 
     private static void DeleteOAuthCookie(HttpContext ctx, DiscordConfig config) =>
@@ -453,11 +506,69 @@ public class Program
                 refreshToken = refresh;
             if (doc.RootElement.TryGetProperty("expires_in", out var exp) &&
                 exp.ValueKind == JsonValueKind.Number && exp.TryGetInt32(out var seconds) && seconds > 0)
-                expiresIn = seconds;
+                expiresIn = Math.Min(seconds, MaxTokenExpiresInSeconds);
             return true;
         }
         catch (JsonException) { return false; }
         catch (InvalidOperationException) { return false; }
+    }
+
+    /// <summary>Ogranicza nonce z Discorda, aby złe dane nie spowodowały przepełnienia daty.</summary>
+    private static DateTimeOffset TokenExpiry(int expiresIn) =>
+        DateTimeOffset.UtcNow.AddSeconds(Math.Clamp(expiresIn, 60, MaxTokenExpiresInSeconds));
+
+    /// <summary>Czyta odpowiedź Discorda z twardym limitem rozmiaru (również dla chunked).</summary>
+    private static async Task<string?> ReadBoundedStringAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        if (response.Content.Headers.ContentLength is long declared && declared > MaxDiscordResponseBytes)
+            return null;
+
+        using var stream = await response.Content.ReadAsStreamAsync(ct);
+        using var collected = new MemoryStream();
+        var buffer = new byte[8192];
+        int total = 0;
+        while (true)
+        {
+            int allowed = Math.Min(buffer.Length, MaxDiscordResponseBytes - total + 1);
+            int read = await stream.ReadAsync(buffer.AsMemory(0, allowed), ct);
+            if (read == 0) break;
+            total += read;
+            if (total > MaxDiscordResponseBytes) return null;
+            collected.Write(buffer, 0, read);
+        }
+        return Encoding.UTF8.GetString(collected.GetBuffer(), 0, (int)collected.Length);
+    }
+
+    /// <summary>Retry-After z nagłówka Discorda lub z pola retry_after w JSON.</summary>
+    private static async Task<TimeSpan?> ParseRetryAfterAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        try
+        {
+            var retry = response.Headers.RetryAfter;
+            if (retry?.Delta is { } delta) return delta;
+            if (retry?.Date is { } date)
+            {
+                var until = date - DateTimeOffset.UtcNow;
+                return until > TimeSpan.Zero ? until : TimeSpan.Zero;
+            }
+        }
+        catch (FormatException) { /* uszkodzony nagłówek — spróbujemy body */ }
+
+        var body = await ReadBoundedStringAsync(response, ct);
+        if (body is null) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                doc.RootElement.TryGetProperty("retry_after", out var element) &&
+                element.ValueKind == JsonValueKind.Number &&
+                element.TryGetDouble(out var seconds) &&
+                double.IsFinite(seconds) && seconds >= 0 && seconds <= MaxRetryAfter.TotalSeconds)
+                return TimeSpan.FromSeconds(seconds);
+        }
+        catch (JsonException) { }
+        catch (InvalidOperationException) { }
+        return null;
     }
 
     private static bool IsInvalidGrant(string json)
@@ -512,8 +623,15 @@ public class Program
         if (clientState.Length != 0 && !IsHex(clientState, 32, 128))
             return false;
 
+        try
+        {
+            expires = DateTimeOffset.FromUnixTimeSeconds(unixExpiry);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return false;
+        }
         state = fields[0];
-        expires = DateTimeOffset.FromUnixTimeSeconds(unixExpiry);
         return true;
     }
 
@@ -524,12 +642,14 @@ public class Program
         string accessToken;
         lock (session.Sync)
         {
-            if (session.RetryAfterUntil > now)
-                return new VerifyResult(VerifyFailure.Technical, "Discord ogranicza żądania. Spróbuj ponownie później.");
+            // Świeży cache jest autorytatywny — chwilowy 429 Discorda nie może
+            // zamienić ważnej, właśnie sprawdzonej roli w błąd techniczny.
             if (session.RoleCheckedAt > DateTimeOffset.MinValue && now - session.RoleCheckedAt < RoleCacheTtl)
                 return session.CachedHasRole
                     ? VerifyResult.Ok
                     : new VerifyResult(VerifyFailure.RoleMissing, "Brak wymaganej roli na serwerze Discord");
+            if (session.RetryAfterUntil > now)
+                return new VerifyResult(VerifyFailure.Technical, "Discord ogranicza żądania. Spróbuj ponownie później.");
             accessToken = session.AccessToken;
         }
 
@@ -544,6 +664,17 @@ public class Program
 
             accessToken = refresh.AccessToken!;
             fetch = await FetchRolesAsync(accessToken, config.GuildId, ct);
+        }
+
+        if (fetch.Status == RoleFetchStatus.Forbidden)
+        {
+            // 403/404 z /users/@me/guilds/{id}/member = definitywny brak członkostwa/dostępu.
+            lock (session.Sync)
+            {
+                session.CachedHasRole = false;
+                session.RoleCheckedAt = DateTimeOffset.UtcNow;
+            }
+            return new VerifyResult(VerifyFailure.RoleMissing, "Użytkownik nie jest członkiem serwera Discord lub nie ma wymaganej roli");
         }
 
         if (fetch.Status == RoleFetchStatus.RateLimited)
@@ -578,12 +709,17 @@ public class Program
 
             if (response.StatusCode == HttpStatusCode.Unauthorized)
                 return new RoleFetch(RoleFetchStatus.Unauthorized, new List<string>(), null);
+            if (response.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.NotFound)
+                return new RoleFetch(RoleFetchStatus.Forbidden, new List<string>(), null);
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
-                return new RoleFetch(RoleFetchStatus.RateLimited, new List<string>(), ParseRetryAfter(response));
+                return new RoleFetch(RoleFetchStatus.RateLimited, new List<string>(),
+                    await ParseRetryAfterAsync(response, ct));
             if (!response.IsSuccessStatusCode)
                 return new RoleFetch(RoleFetchStatus.Technical, new List<string>(), null);
 
-            var json = await response.Content.ReadAsStringAsync(ct);
+            var json = await ReadBoundedStringAsync(response, ct);
+            if (json is null)
+                return new RoleFetch(RoleFetchStatus.Technical, new List<string>(), null);
             using var doc = JsonDocument.Parse(json);
             if (doc.RootElement.ValueKind != JsonValueKind.Object ||
                 !doc.RootElement.TryGetProperty("roles", out var arr) ||
@@ -600,6 +736,10 @@ public class Program
                 }
             }
             return new RoleFetch(RoleFetchStatus.Ok, roles, null);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or HttpRequestException or OperationCanceledException)
         {
@@ -667,20 +807,22 @@ public class Program
 
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
             {
-                var delay = ClampRetry(ParseRetryAfter(response) ?? TimeSpan.FromSeconds(30));
+                var delay = ClampRetry(
+                    await ParseRetryAfterAsync(response, CancellationToken.None) ?? TimeSpan.FromSeconds(30));
                 lock (session.Sync) session.RetryAfterUntil = DateTimeOffset.UtcNow + delay;
                 return new RefreshOutcome(RefreshStatus.Technical, null);
             }
             if (!response.IsSuccessStatusCode)
             {
-                var body = await response.Content.ReadAsStringAsync(CancellationToken.None);
-                return IsInvalidGrant(body)
+                var body = await ReadBoundedStringAsync(response, CancellationToken.None);
+                return body is not null && IsInvalidGrant(body)
                     ? new RefreshOutcome(RefreshStatus.InvalidGrant, null)
                     : new RefreshOutcome(RefreshStatus.Technical, null);
             }
 
-            var json = await response.Content.ReadAsStringAsync(CancellationToken.None);
-            if (!TryParseTokenResponse(json, out var access, out var rotatedRefresh, out var expiresIn) ||
+            var json = await ReadBoundedStringAsync(response, CancellationToken.None);
+            if (json is null ||
+                !TryParseTokenResponse(json, out var access, out var rotatedRefresh, out var expiresIn) ||
                 string.IsNullOrWhiteSpace(access))
                 return new RefreshOutcome(RefreshStatus.Technical, null);
 
@@ -688,7 +830,7 @@ public class Program
             {
                 session.AccessToken = access;
                 session.RefreshToken = rotatedRefresh ?? session.RefreshToken;
-                session.AccessTokenExpires = DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, expiresIn));
+                session.AccessTokenExpires = TokenExpiry(expiresIn);
             }
             return new RefreshOutcome(RefreshStatus.Ok, access);
         }
@@ -696,19 +838,6 @@ public class Program
         {
             return new RefreshOutcome(RefreshStatus.Technical, null);
         }
-    }
-
-    private static TimeSpan? ParseRetryAfter(HttpResponseMessage response)
-    {
-        var retry = response.Headers.RetryAfter;
-        if (retry is null) return null;
-        if (retry.Delta is { } delta) return delta;
-        if (retry.Date is { } date)
-        {
-            var value = date - DateTimeOffset.UtcNow;
-            return value > TimeSpan.Zero ? value : TimeSpan.Zero;
-        }
-        return null;
     }
 
     private static TimeSpan ClampRetry(TimeSpan retry) =>
@@ -740,7 +869,8 @@ public class Program
         return $"{header}.{payload}.{signature}";
     }
 
-    private static bool ValidateJwt(string token, DiscordConfig config, out Dictionary<string, string> claims)
+    private static bool ValidateJwt(string token, DiscordConfig config, out Dictionary<string, string> claims,
+        bool allowExpired = false)
     {
         claims = new Dictionary<string, string>(StringComparer.Ordinal);
         if (string.IsNullOrWhiteSpace(token) || token.Length > MaxJwtLength)
@@ -784,7 +914,9 @@ public class Program
                 !long.TryParse(iatText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var iat)) return false;
 
             var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            if (exp <= now || iat > now + 60 || exp - iat > (long)JwtLifetime.TotalSeconds + 60)
+            if (!allowExpired && exp <= now) return false;
+            // 60 s tolerancji dla przyszłego iat (clock skew); brak refresh endpointu.
+            if (iat > now + 60 || exp - iat > (long)JwtLifetime.TotalSeconds + 60)
                 return false;
             return true;
         }
@@ -794,30 +926,22 @@ public class Program
         catch (ArgumentException) { return false; }
     }
 
-    private static string RatePartition(HttpContext ctx, string bucket)
+    private static string RatePartition(HttpContext ctx, string bucket, DiscordConfig config)
     {
         var ip = ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
         if (bucket != "api") return $"{bucket}:{ip}";
-        var sid = PeekSid(ctx);
+        // sid musi pochodzić z podpisanego tokenu — inaczej napastnik mógłby
+        // dowolnym payloadem JWT resetować limit dla tego samego IP.
+        var sid = PeekSid(ctx, config);
         return string.IsNullOrEmpty(sid) ? $"{bucket}:{ip}" : $"{bucket}:{ip}:{sid}";
     }
 
     /// <summary>Tylko do klucza rate limitu — nie używamy tego do autoryzacji.</summary>
-    private static string PeekSid(HttpContext ctx)
+    private static string PeekSid(HttpContext ctx, DiscordConfig config)
     {
         var token = BearerToken(ctx);
-        if (token is null || token.Length > MaxJwtLength) return "";
-        try
-        {
-            var parts = token.Split('.');
-            if (parts.Length != 3) return "";
-            using var doc = JsonDocument.Parse(Base64UrlDecodeBytes(parts[1]));
-            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                TryGetJsonString(doc.RootElement, "sid", out var sid))
-                return sid ?? "";
-        }
-        catch { /* celowo: to tylko partycja rate limitu */ }
-        return "";
+        if (token is null || !ValidateJwt(token, config, out var claims)) return "";
+        return claims.GetValueOrDefault("sid", "");
     }
 
     private static bool IsHex(string value, int minLength, int maxLength)
@@ -866,15 +990,22 @@ public class Program
         catch (OperationCanceledException) { }
     }
 
+    private static bool IsPlaceholder(string value)
+    {
+        var lower = value.ToLowerInvariant();
+        foreach (var marker in new[] { "replace-with", "change-", "example", "your-", "xxx" })
+            if (lower.Contains(marker, StringComparison.Ordinal)) return true;
+        return lower is "secret" or "changeme";
+    }
+
     private static void ValidateJwtSecret(string secret)
     {
         if (string.IsNullOrWhiteSpace(secret) || Encoding.UTF8.GetByteCount(secret) < 32)
             throw new InvalidOperationException("JWT_SECRET musi mieć co najmniej 32 bajty entropii.");
 
         var lower = secret.ToLowerInvariant();
-        foreach (var placeholder in new[] { "replace-with-", "change-", "example", "secret" })
-            if (lower.Contains(placeholder, StringComparison.Ordinal))
-                throw new InvalidOperationException("JWT_SECRET zawiera wartość przykładową — wygeneruj nowy, losowy sekret.");
+        if (IsPlaceholder(secret) || lower.Contains("secret", StringComparison.Ordinal))
+            throw new InvalidOperationException("JWT_SECRET zawiera wartość przykładową — wygeneruj nowy, losowy sekret.");
 
         if (secret.Distinct().Count() < 12)
             throw new InvalidOperationException("JWT_SECRET ma zbyt mało entropii.");
