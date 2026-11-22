@@ -12,8 +12,20 @@ Ustaw zmienne środowiskowe przed uruchomieniem:
 | `DISCORD_CLIENT_SECRET` | Secret aplikacji Discord |
 | `DISCORD_GUILD_ID` | ID Twojego serwera Discord |
 | `DISCORD_REQUIRED_ROLE_ID` | ID roli wymaganej do korzystania z aplikacji |
-| `JWT_SECRET` | Dowolny tajny klucz do podpisywania tokenów (min. 32 znaki) |
+| `JWT_SECRET` | Tajny klucz do podpisywania tokenów (min. 16 znaków; wartość domyślna jest odrzucana) |
 | `API_URL` | Publiczny adres serwera (np. https://vertex-tweaks-api.onrender.com) |
+
+Serwer nie uruchomi się, jeśli którejkolwiek z tych zmiennych brakuje lub `JWT_SECRET` jest zbyt krótki.
+
+## Model bezpieczeństwa
+
+- `state` OAuth jest generowany przez aplikację, zapisywany na serwerze i sprawdzany przy callbacku
+  oraz po stronie klienta — chroni to przed logowaniem CSRF.
+- Token JWT zawiera identyfikator sesji (`sid`). Przy każdym `/api/verify` serwer ponownie pyta Discord
+  o członkostwo i rolę **Vertex**, więc cofnięcie roli blokuje dostęp natychmiast.
+- Access token Discord jest przechowywany tylko w pamięci serwera i jest odświeżany z refresh tokenu.
+  Po restarcie serwera trzeba zalogować się ponownie.
+- `POST /api/logout` unieważnia sesję po stronie serwera (nie tylko lokalnie w aplikacji).
 
 ## Uruchomienie lokalne
 
@@ -67,4 +79,5 @@ private const string ApiUrl = "https://vertex-tweaks-api.onrender.com";
 | --- | --- |
 | GET /auth/discord | Redirect do Discord OAuth |
 | GET /auth/callback | Callback po autoryzacji Discord |
-| GET /api/verify | Weryfikacja tokenu (Bearer) |
+| GET /api/verify | Weryfikacja tokenu (Bearer) + ponowne sprawdzenie roli Discord |
+| POST /api/logout | Unieważnienie sesji serwerowej (Bearer) |
