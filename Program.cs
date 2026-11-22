@@ -756,11 +756,6 @@ public class Program
             {
                 task = session.RefreshTask;
             }
-            else if (DateTimeOffset.UtcNow < session.AccessTokenExpires.AddMinutes(-5) &&
-                     !string.IsNullOrWhiteSpace(session.AccessToken))
-            {
-                return new RefreshOutcome(RefreshStatus.Ok, session.AccessToken);
-            }
             else
             {
                 // Jedno odświeżanie na sesję — równoległe /api/verify nie wykonują rotacji 2×.
